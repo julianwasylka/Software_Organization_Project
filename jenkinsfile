@@ -1,0 +1,385 @@
+def runCmd(cmd) {
+    if (isUnix()) {
+        sh cmd
+    }
+    else {
+        bat cmd
+    }
+}
+
+def echoMessage(msg){
+    echo '=============='+msg+'=============='
+}
+
+pipeline {
+    agent any;
+
+    triggers {
+        githubPush()
+    }
+
+    options {
+        timestamps()
+    }
+
+    environment {
+        GITHUB_URL='https://github.com/1230200ISEP/arqsoft_odsoft_m1d_1230200_1240261.git'
+        GITHUB_BRANCH='feature/odsoft-pipeline'
+        GITHUB_CREDENTIALS='github_credentials'
+
+        JENKINS_NODE_COOKIE="dontKillMe"
+    }
+
+    stages {
+        stage('Terminate Application Process') {
+            steps {
+                echoMessage('Terminating Application Process')
+                script {
+                    try {
+                        int attempts = 0
+                        boolean processTerminated = false
+
+                        while (attempts < 3 && !processTerminated) {
+                            attempts++
+
+                            if (isUnix()) {
+                                def result = sh(script: "fuser -k 2228/tcp || true", returnStatus: true)
+                                if (result == 0) {
+                                    processTerminated = true
+                                    echo "Process on port 2228 terminated successfully."
+                                } else {
+                                    echo "No process found on port 2228. Attempt ${attempts}/3..."
+                                }
+                            } else {
+                                // Check for process on port 8081 and terminate if found
+                                def checkProcess = bat(script: 'netstat -aon | findstr ":8081"', returnStatus: true)
+                                if (checkProcess == 0) {
+                                    echo "Process found on port 8081. Attempting to terminate it..."
+
+                                    // Attempt to kill the process and capture the exit code
+                                    def killProcess = bat(
+                                        script: '''
+                                            for /f "tokens=5" %%a in ('netstat -aon ^| findstr ":8081"') do (
+                                                taskkill /F /PID %%a && exit 0
+                                            )
+                                        ''',
+                                        returnStatus: true
+                                    )
+
+                                    // Output the result
+                                    if (killProcess == 0) {
+                                        processTerminated = true;
+                                        echo "Process on port 8081 terminated successfully."
+                                    } else {
+                                        echo "No process found on port 8081 or it was already terminated."
+                                    }
+
+                                } else {
+                                    echo "No process found on port 8081. Attempt ${attempts}/3..."
+                                }
+                            }
+
+                            // Pause before retrying, if necessary
+                            if (!processTerminated && attempts < 3) {
+                                sleep time: 1, unit: 'SECONDS'
+                            }
+                        }
+
+                        if (!processTerminated) {
+                            echo "Process not found after ${attempts} attempts. Continuing the pipeline..."
+                        }
+                    } catch (Exception e) {
+                        echo "An error occurred: ${e.message}. Continuing the pipeline..."
+                    }
+                }
+                echoMessage('Terminate Application Process Completed')
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                echoMessage('Repository Checkout')
+                git branch: "${GITHUB_BRANCH}",
+                credentialsId: "${GITHUB_CREDENTIALS}",
+                url: "${GITHUB_URL}"
+                echoMessage('Repository Checkout Completed')
+            }
+        }
+
+        stage('Clean') {
+            steps {
+                echoMessage('Clean')
+                script {
+                     if (isUnix()) {
+                        runCmd('chmod +x ./mvnw')
+                     }
+                }
+                runCmd('./mvnw clean')
+                echoMessage('Clean Completed')
+            }
+        }
+
+        stage('Validate') {
+            steps {
+                echoMessage('Validate')
+                runCmd('./mvnw validate')
+                echoMessage('Validate Completed')
+            }
+        }
+
+        stage('Compile') {
+            steps {
+                echoMessage('Compile')
+                runCmd('./mvnw compile')
+                echoMessage('Compile Completed')
+            }
+        }
+
+        stage('Code Quality and JavaDoc') {
+            failFast true
+            parallel {
+                stage('CheckStyle') {
+                    steps {
+                       echoMessage('CheckStyle')
+                       runCmd('./mvnw checkstyle:checkstyle')
+                       echoMessage('CheckStyle Completed')
+                    }
+                }
+                stage('SpotBugs') {
+                    steps {
+                       echoMessage('Spotbugs')
+                       runCmd('./mvnw spotbugs:spotbugs')
+                       echoMessage('Spotbugs Completed')
+                    }
+                }
+                stage('Javadoc') {
+                    steps {
+                       echoMessage('Javadoc')
+                       runCmd('./mvnw javadoc:javadoc')
+                       echoMessage('Javadoc Completed')
+                    }
+                }
+            }
+        }
+
+        stage('Publish Code Quality and JavaDoc Reports') {
+            parallel {
+                stage('Publish Checkstyle Report') {
+                    steps {
+                        echoMessage('Publish Checkstyle Report')
+                        publishHTML([allowMissing: true,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: false,
+                            reportDir: 'target/reports/checkstyle',
+                            reportFiles: 'checkstyle.html',
+                            reportName: 'HTML Checkstyle Report',
+                            reportTitles: '',
+                            useWrapperFileDirectly: true])
+                        echoMessage('Publish Checkstyle Report Completed')
+                    }
+                }
+
+                stage('Publish Spotbugs Report') {
+                    steps {
+                        echoMessage('Publish Spotbugs Report')
+                        publishHTML([allowMissing: true,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: false,
+                            reportDir: 'target/reports/spotbugs',
+                            reportFiles: 'spotbugs.html',
+                            reportName: 'HTML Spotbugs Report',
+                            reportTitles: '',
+                            useWrapperFileDirectly: true])
+                        echoMessage('Publish Spotbugs Report Completed')
+                    }
+                }
+
+                stage('Publish API Report') {
+                    steps {
+                        echoMessage('Publish API Report')
+                        publishHTML([allowMissing: true,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: false,
+                            reportDir: 'target/reports/apidocs',
+                            reportFiles: 'index.html',
+                            reportName: 'HTML API Report',
+                            reportTitles: '',
+                            useWrapperFileDirectly: true])
+                        echoMessage('Publish API Report Completed')
+                    }
+                }
+            }
+        }
+
+        stage('Unit, Integration, Acceptance Tests') {
+            failFast true
+            parallel {
+                stage('Unit Tests') {
+                    steps {
+                        echoMessage('Unit Tests')
+                        runCmd('./mvnw test')
+                        echoMessage('Unit Tests Completed')
+                    }
+                }
+
+                stage('Integration Tests') {
+                    steps {
+                        echoMessage('Integration Tests')
+                        runCmd('./mvnw failsafe:integration-test')
+                        echoMessage('Integration Tests Completed')
+                    }
+                }
+
+                stage('Acceptance Tests') {
+                    steps {
+                        echoMessage('Acceptance Tests')
+                        runCmd('./mvnw test -Dtest=**/*AcceptanceTestCase')
+                        echoMessage('Acceptance Tests Completed')
+                    }
+                }
+            }
+        }
+
+        stage('Mutation Tests') {
+            steps {
+                echoMessage('Mutation Tests')
+                runCmd('./mvnw test-compile org.pitest:pitest-maven:mutationCoverage')
+                echoMessage('Mutation Tests Completed')
+            }
+        }
+
+        stage('Unit, Integration Tests Reports and Test Coverage Report') {
+            parallel {
+                stage('Unit Tests Report') {
+                    steps {
+                        echoMessage('Unit Tests Report')
+                        runCmd('./mvnw surefire-report:report-only')
+                        echoMessage('Unit Tests Report Completed')
+                    }
+                }
+
+                stage('Integration Tests Report') {
+                    steps {
+                        echoMessage('Integration Tests Report')
+                        runCmd('./mvnw surefire-report:failsafe-report-only')
+                        echoMessage('Integration Tests Report Completed')
+                    }
+                }
+
+                stage('Test Coverage Report') {
+                    steps {
+                        echoMessage('Test Coverage Report')
+                        runCmd('./mvnw jacoco:report')
+                        echoMessage('Test Coverage Report Completed')
+                    }
+                }
+            }
+        }
+
+        stage('Unit, Integration and Mutation Tests Reports and Test Coverage Report') {
+            parallel {
+                stage('Publish Unit Tests Report') {
+                    steps {
+                        echoMessage('Publish Unit Tests Report')
+                        publishHTML([allowMissing: true,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: false,
+                            reportDir: 'target/reports/surefire-failsafe',
+                            reportFiles: 'surefire.html',
+                            reportName: 'Unit Test Report',
+                            reportTitles: '',
+                            useWrapperFileDirectly: true])
+                        echoMessage('Publish Unit Tests Report Completed')
+                    }
+                }
+
+                stage('Publish Integration Tests Report') {
+                    steps {
+                        echoMessage('Publish Integration Tests Report')
+                        publishHTML([allowMissing: true,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: false,
+                            reportDir: 'target/reports/surefire-failsafe',
+                            reportFiles: 'failsafe.html',
+                            reportName: 'Integration Test Report',
+                            reportTitles: '',
+                            useWrapperFileDirectly: true])
+                        echoMessage('Publish Integration Tests Report Completed')
+                    }
+                }
+
+                stage('Publish Mutation Tests Report') {
+                    steps {
+                        echoMessage('Publish Mutation Tests Report')
+                        publishHTML([allowMissing: true,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: false,
+                            reportDir: 'target/reports/pitest',
+                            reportFiles: 'index.html',
+                            reportName: 'Pitest Report',
+                            reportTitles: '',
+                            useWrapperFileDirectly: true])
+                        echoMessage('Publish Mutation Tests Report Completed')
+                    }
+                }
+
+                stage('Publish Test Coverage Report') {
+                    steps {
+                        echoMessage('Publish Test Coverage Report')
+                        publishHTML([allowMissing: true,
+                            alwaysLinkToLastBuild: true,
+                            keepAll: false,
+                            reportDir: 'target/reports/jacoco',
+                            reportFiles: 'index.html',
+                            reportName: 'Test Coverage Report',
+                            reportTitles: '',
+                            useWrapperFileDirectly: true])
+                        echoMessage('Publish Test Coverage Report Completed')
+                    }
+                }
+            }
+        }
+
+        stage('Package') {
+            steps {
+                echoMessage('Package')
+                runCmd('./mvnw package -DskipTests')
+                echoMessage('Package Completed')
+            }
+        }
+
+        stage('Verify') {
+            steps {
+                echoMessage('Verify')
+                runCmd('./mvnw verify -DskipTests')
+                echoMessage('Verify Completed')
+            }
+        }
+
+        stage('Install') {
+            steps {
+                echoMessage('Install')
+                runCmd('./mvnw install -DskipTests')
+                echoMessage('Install Completed')
+            }
+        }
+
+        stage('Run Application') {
+            steps {
+                echoMessage('Run Application')
+                script {
+                    def jarPath = "${workspace}/target/psoft-g1-0.0.1-SNAPSHOT.jar"
+                    def command = "java -jar ${jarPath}"
+
+                    if (isUnix()) {
+                        sh "nohup ${command} --server.port=2228 &"
+                    }
+                    else {
+                        bat "start /B ${command} --server.port=8081"
+                    }
+                }
+                echoMessage('Run Application Completed')
+            }
+        }
+    }
+}
